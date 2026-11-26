@@ -1,7 +1,7 @@
 """🧠 Другий мозок — персональний пошук і Q&A по пошті, календарю та нотатках. Один файл."""
 from __future__ import annotations
 
-import base64, datetime as dt, email, hashlib, imaplib, io, os, re, sqlite3, tempfile, zlib
+import base64, datetime as dt, email, hashlib, imaplib, io, os, re, sqlite3, tempfile, time, zlib
 from email import policy
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -53,11 +53,8 @@ def get_e5():
 
 
 def e5_available() -> bool:
-    try:
-        import sentence_transformers  # noqa: F401
-        return True
-    except Exception:
-        return False
+    import importlib.util  # find_spec не імпортує torch, тож інтерфейс не зависає
+    return importlib.util.find_spec("sentence_transformers") is not None
 
 
 # =====================================================================
@@ -330,7 +327,8 @@ def ask_llm(q, hits, history, provider, model, redact, host):
             {"role": "system", "content": system}, {"role": "user", "content": user}]})
         r.raise_for_status()
         text = r.json()["message"]["content"]
-    return red.restore(text) if isinstance(red, Redactor) else text
+    sent = user if provider == "anthropic" else None  # рівно те, що пішло в хмару
+    return (red.restore(text) if isinstance(red, Redactor) else text), sent
 
 
 # =====================================================================
@@ -449,6 +447,8 @@ SRC = {"mail": "✉️ пошта", "calendar": "📅 календар", "note":
 
 # ---------- розблокування ----------
 if "vault" not in st.session_state:
+    if st.session_state.pop("locked_msg", False):
+        st.warning("Сховище заблоковано через бездіяльність.")
     name = re.sub(r"[^\w-]", "_", st.text_input("Ім'я сховища", "default", help="Різні імена — окремі сховища"))
     path = f"vaults/{name}.vault"
     exists = os.path.exists(path)
@@ -470,6 +470,11 @@ if "vault" not in st.session_state:
     st.stop()
 
 vault: Vault = st.session_state.vault
+
+st.session_state.setdefault("idle_min", 30)
+if st.session_state.idle_min and time.time() - st.session_state.get("last", time.time()) > st.session_state.idle_min * 60:
+    st.session_state.clear(); st.session_state["locked_msg"] = True; st.rerun()
+st.session_state.last = time.time()
 
 # ---------- бокова панель ----------
 with st.sidebar:
@@ -505,6 +510,8 @@ with st.sidebar:
         redact = False
 
     st.header("💾 Сховище")
+    st.slider("Автоблокування, хв (0 — вимкнено)", 0, 240, key="idle_min",
+              help="Спрацьовує при наступній дії після простою; дані зникають із пам'яті сервера.")
     st.caption(f"«{st.session_state.name}» · " + (", ".join(f"{SRC.get(k, k)}: {v}" for k, v in vault.stats().items()) or "порожньо"))
     if st.button("Підготувати резервну копію"):
         st.session_state.backup = vault.blob()
@@ -527,7 +534,7 @@ if vault.stats() and vault.kind() not in (None, emb.name):
     if st.button("Переіндексувати"):
         bar = st.progress(0.0); vault.reindex(emb, bar.progress); vault.save(); st.rerun()
 
-tab_chat, tab_src, tab_arch = st.tabs(["💬 Питання", "📥 Джерела", "🗂 Архів"])
+tab_chat, tab_dig, tab_src, tab_arch, tab_ppl = st.tabs(["💬 Питання", "📰 Дайджест", "📥 Джерела", "🗂 Архів", "👥 Люди"])
 
 # ---------- чат ----------
 def show_sources(hits):
@@ -535,6 +542,11 @@ def show_sources(hits):
         for h in hits:
             st.markdown(f"**[{h['n']}] {SRC.get(h['source'], h['source'])} · {h['title']} · {fmt(h['ts'])}**")
             st.text(h["text"][:800])
+
+
+def show_sent(sent):
+    with st.expander("🔍 Що саме пішло в хмару (після маскування)"):
+        st.code(sent, language=None)
 
 
 with tab_chat:
@@ -545,6 +557,8 @@ with tab_chat:
             st.markdown(m["content"])
             if m.get("hits"):
                 show_sources(m["hits"])
+            if m.get("sent"):
+                show_sent(m["sent"])
     if q := st.chat_input("Що ми домовлялися з постачальником у березні?"):
         history = list(st.session_state.messages)
         st.session_state.messages.append({"role": "user", "content": q})
@@ -554,7 +568,7 @@ with tab_chat:
             with st.spinner("Шукаю…"):
                 rng = manual_rng or parse_dates(q)
                 hits = search(vault, q, emb, top_k, kinds, rng)
-                note = ""
+                note, sent = "", None
                 if not hits and rng:
                     hits = search(vault, q, emb, top_k, kinds, None)
                     note = "За цей період нічого не знайшлося — шукаю по всьому архіву."
@@ -570,15 +584,25 @@ with tab_chat:
             else:
                 try:
                     with st.spinner("Формулюю відповідь…"):
-                        text = ask_llm(q, hits, history, provider, model, redact, host)
+                        text, sent = ask_llm(q, hits, history, provider, model, redact, host)
                 except Exception as e:
                     text = f"⚠️ Помилка моделі: {e}\n\nФрагменти знайдено — вони нижче."
             st.markdown(text)
             if hits:
                 show_sources(hits)
-        st.session_state.messages.append({"role": "assistant", "content": text, "hits": hits})
-    if st.session_state.messages and st.button("Очистити розмову"):
-        st.session_state.messages = []; st.rerun()
+            if sent:
+                show_sent(sent)
+        st.session_state.messages.append({"role": "assistant", "content": text, "hits": hits, "sent": sent})
+    if st.session_state.messages:
+        md = ["# Розмова з «Другим мозком»\n"]
+        for m in st.session_state.messages:
+            md.append(f"**{'Ви' if m['role'] == 'user' else 'Асистент'}:** {m['content']}\n")
+            md += [f"- [{h['n']}] {h['source']} · {h['title']} · {fmt(h['ts'])}" for h in m.get("hits") or []]
+            md.append("")
+        e1, e2 = st.columns(2)
+        e1.download_button("⬇️ Експорт розмови (.md)", "\n".join(md), "розмова.md")
+        if e2.button("Очистити розмову"):
+            st.session_state.messages = []; st.rerun()
 
 # ---------- джерела ----------
 with tab_src:
@@ -655,3 +679,107 @@ with tab_arch:
             st.text_area("Вміст", body, height=300, disabled=True)
             if st.button("Видалити документ"):
                 vault.delete(did); vault.save(); st.rerun()
+
+
+# ---------- дайджест ----------
+WD = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд")
+KW = re.compile(r"(домов|погодили|узгод|дедлайн|термін|не пізніше|до \d{1,2}[./]\d{1,2}|потрібно|треба|обіця|надішл|оплат)", re.I)
+
+with tab_dig:
+    days = st.slider("Горизонт, днів (уперед для подій, назад для листів)", 3, 30, 14, key="dig_days")
+    now = dt.datetime.now().timestamp()
+    st.subheader("📅 Найближчі події")
+    ev = vault.db.execute("SELECT title, ts, body FROM docs WHERE source='calendar' AND ts>=? AND ts<? ORDER BY ts LIMIT 50",
+                          (now, now + days * 86400)).fetchall()
+    for t, ts, b in ev:
+        d = dt.datetime.fromtimestamp(ts)
+        place = re.search(r"Де: (.+)", b)
+        st.markdown(f"**{WD[d.weekday()]} {d:%d.%m %H:%M}** — {t}" + (f" · 📍 {place.group(1)}" if place else ""))
+    if not ev:
+        st.caption("Подій на цей період немає (імпортуйте .ics у «Джерелах»).")
+
+    st.subheader("🕑 Нове в архіві")
+    rec = vault.db.execute("SELECT source, title, ts FROM docs WHERE source!='calendar' AND ts>=? ORDER BY ts DESC LIMIT 15",
+                           (now - days * 86400,)).fetchall()
+    for s_, t, ts in rec:
+        st.markdown(f"{SRC.get(s_, s_)} · **{t[:90]}** · {fmt(ts)}")
+    if not rec:
+        st.caption("За цей період нових документів немає.")
+
+    st.subheader("✅ Домовленості та дедлайни")
+    st.caption("Шукає у листах і нотатках за період фрази про домовленості, терміни й завдання.")
+    if st.button("Знайти домовленості", key="dig_btn"):
+        rows = vault.db.execute(
+            "SELECT d.source, d.title, d.ts, c.text FROM chunks c JOIN docs d ON d.id=c.doc_id "
+            "WHERE d.source IN ('mail','note') AND d.ts>=? ORDER BY d.ts DESC LIMIT 400", (now - days * 86400,)).fetchall()
+        picked = [r for r in rows if KW.search(r[3])][:20]
+        hits = [dict(n=i + 1, source=a, title=b, ts=c, text=x[:700]) for i, (a, b, c, x) in enumerate(picked)]
+        if not hits:
+            st.info("Нічого схожого на домовленості за цей період.")
+        elif provider == "none":
+            for h in hits:
+                lines = [l.strip() for l in h["text"].splitlines() if KW.search(l)][:3]
+                st.markdown(f"**[{h['n']}] {h['title']}** ({fmt(h['ts'])})\n" + "\n".join(f"- {l}" for l in lines))
+        else:
+            try:
+                with st.spinner("Аналізую…"):
+                    ans, sent = ask_llm("Випиши списком усі домовленості, обіцянки, завдання та дедлайни (з датами й "
+                                        "учасниками). Згрупуй за людьми або проєктами.", hits, [], provider, model, redact, host)
+                st.markdown(ans)
+                if sent:
+                    show_sent(sent)
+                show_sources(hits)
+            except Exception as e:
+                st.error(f"Помилка моделі: {e}")
+
+# ---------- люди ----------
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+NAMED_RE = re.compile(r"([^<>,;\n:]{2,60}?)\s*<([\w.+-]+@[\w-]+(?:\.[\w-]+)+)>")
+
+
+@st.cache_data(show_spinner=False)
+def people_index(_vault, sig):
+    people = {}
+    for did, ts, body in _vault.db.execute("SELECT id, ts, body FROM docs WHERE source IN ('mail','calendar')"):
+        head = "\n".join(l for l in body.splitlines()[:6] if l.split(":")[0] in ("Від", "Кому", "Копія", "Учасники"))
+        names = {e.lower(): n.strip().strip('"') for n, e in NAMED_RE.findall(head)}
+        for e in {x.lower() for x in EMAIL_RE.findall(head)}:
+            p = people.setdefault(e, dict(email=e, name="", n=0, last=0.0, docs=[]))
+            p["name"] = p["name"] or names.get(e, "")
+            p["n"] += 1; p["last"] = max(p["last"], ts); p["docs"].append(did)
+    return people
+
+
+with tab_ppl:
+    sig = vault.db.execute("SELECT COUNT(*), COALESCE(MAX(ts),0), COALESCE(SUM(rowid),0) FROM docs").fetchone()
+    people = people_index(vault, str(sig))
+    if not people:
+        st.write("Контактів поки немає — синхронізуйте пошту або календар.")
+    else:
+        flt = st.text_input("Пошук людини (ім'я або email)", key="ppl_flt").lower()
+        lst = sorted((p for p in people.values() if flt in (p["email"] + p["name"]).lower()), key=lambda p: -p["n"])[:200]
+        if lst:
+            st.dataframe(pd.DataFrame([dict(Ім_я=p["name"], Email=p["email"], Листів_і_подій=p["n"], Останнє=fmt(p["last"]))
+                                       for p in lst]), hide_index=True)
+            who = st.selectbox("Хронологія спілкування", [p["email"] for p in lst],
+                               format_func=lambda e: f"{people[e]['name'] or e} · {e}")
+            ids = people[who]["docs"]
+            docs = vault.db.execute(f"SELECT source, title, ts, body FROM docs WHERE id IN ({','.join('?' * len(ids))}) "
+                                    f"ORDER BY ts DESC", ids).fetchall()
+            if st.button("🧾 Підсумувати, про що ми домовлялися", key="ppl_sum"):
+                if provider == "none":
+                    st.info("Оберіть модель у бічній панелі — підсумок формує LLM.")
+                else:
+                    hits = [dict(n=i + 1, source=a, title=b, ts=c, text=x[:800]) for i, (a, b, c, x) in enumerate(docs[:8])]
+                    try:
+                        with st.spinner("Аналізую…"):
+                            ans, sent = ask_llm(f"Підсумуй, про що і які були домовленості з {people[who]['name'] or who}. "
+                                                f"Вкажи дати й відкриті питання.", hits, [], provider, model, redact, host)
+                        st.markdown(ans)
+                        if sent:
+                            show_sent(sent)
+                    except Exception as e:
+                        st.error(f"Помилка моделі: {e}")
+            for a, b, c, x in docs[:50]:
+                with st.expander(f"{fmt(c)} · {SRC.get(a, a)} · {b[:80]}"):
+                    st.text(x[:1200])
