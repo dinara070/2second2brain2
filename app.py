@@ -534,7 +534,8 @@ if vault.stats() and vault.kind() not in (None, emb.name):
     if st.button("Переіндексувати"):
         bar = st.progress(0.0); vault.reindex(emb, bar.progress); vault.save(); st.rerun()
 
-tab_chat, tab_dig, tab_src, tab_arch, tab_ppl = st.tabs(["💬 Питання", "📰 Дайджест", "📥 Джерела", "🗂 Архів", "👥 Люди"])
+tab_chat, tab_dig, tab_src, tab_arch, tab_ppl, tab_tl = st.tabs(
+    ["💬 Питання", "📰 Дайджест", "📥 Джерела", "🗂 Архів", "👥 Люди", "🕰 Хронологія"])
 
 # ---------- чат ----------
 def show_sources(hits):
@@ -549,16 +550,29 @@ def show_sent(sent):
         st.code(sent, language=None)
 
 
+def pin_answer(i):
+    m = st.session_state.messages[i]
+    qtxt = st.session_state.messages[i - 1]["content"] if i else ""
+    src = "; ".join(f"[{h['n']}] {h['title']}" for h in m.get("hits") or [])
+    vault.upsert(f"note:pin:{hashlib.md5(m['content'].encode()).hexdigest()[:10]}", "note",
+                 f"Збережена відповідь: {qtxt[:70]}", f"Питання: {qtxt}\n\n{m['content']}\n\nДжерела: {src}",
+                 time.time(), emb)
+    vault.save()
+    st.toast("Збережено в пам'ять 📌")
+
+
 with tab_chat:
     if not vault.stats():
         st.info("Архів порожній — додайте дані у вкладці «Джерела». Можна почати з файлів, нотаток чи .ics.")
-    for m in st.session_state.messages:
+    for i, m in enumerate(st.session_state.messages):
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
             if m.get("hits"):
                 show_sources(m["hits"])
             if m.get("sent"):
                 show_sent(m["sent"])
+            if m["role"] == "assistant" and m.get("hits") and st.button("📌 Зберегти в пам'ять", key=f"pin{i}"):
+                pin_answer(i)
     if q := st.chat_input("Що ми домовлялися з постачальником у березні?"):
         history = list(st.session_state.messages)
         st.session_state.messages.append({"role": "user", "content": q})
@@ -592,6 +606,8 @@ with tab_chat:
                 show_sources(hits)
             if sent:
                 show_sent(sent)
+            if hits:
+                st.button("📌 Зберегти в пам'ять", key=f"pin{len(st.session_state.messages)}")  # обробляється після rerun
         st.session_state.messages.append({"role": "assistant", "content": text, "hits": hits, "sent": sent})
     if st.session_state.messages:
         md = ["# Розмова з «Другим мозком»\n"]
@@ -677,8 +693,59 @@ with tab_arch:
             did = view.id[pick]
             body = vault.db.execute("SELECT body FROM docs WHERE id=?", (did,)).fetchone()[0]
             st.text_area("Вміст", body, height=300, disabled=True)
+            rel = [h for h in search(vault, f"{view.title[pick]} {body[:300]}", emb, 8, None) if h["id"] != did][:5]
+            if rel:
+                st.markdown("**🔗 Пов'язане:** " + " · ".join(f"{SRC.get(h['source'], h['source'])} «{h['title'][:50]}» ({fmt(h['ts'])})" for h in rel))
             if st.button("Видалити документ"):
                 vault.delete(did); vault.save(); st.rerun()
+
+
+# ---------- дедлайни ----------
+MONTH_GEN = {"січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6, "липня": 7,
+             "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12}
+TRIG = re.compile(r"(до |дедлайн|не пізніше|термін|оплат|здат|надішл|deadline|протягом)", re.I)
+NUM_D = re.compile(r"\b(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\b")
+TXT_D = re.compile(r"\b(\d{1,2})\s+(" + "|".join(MONTH_GEN) + r")(?:\s+(\d{4}))?", re.I)
+
+
+def _mkdate(d, m, y, ref):
+    try:
+        if y is None:
+            dd = dt.date(ref.year, m, d)
+            return dd if dd >= ref.date() - dt.timedelta(days=30) else dt.date(ref.year + 1, m, d)
+        y = int(y)
+        return dt.date(y + 2000 if y < 100 else y, m, d)
+    except ValueError:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def deadline_index(_vault, sig):
+    out, seen = [], set()
+    for did, title, ts, body in _vault.db.execute("SELECT id, title, ts, body FROM docs WHERE source IN ('mail','note')"):
+        ref = dt.datetime.fromtimestamp(ts)
+        for line in body.splitlines():
+            if not TRIG.search(line):
+                continue
+            found = [(int(a), int(b), c or None) for a, b, c in NUM_D.findall(line)] + \
+                    [(int(a), MONTH_GEN[b.lower()], c or None) for a, b, c in TXT_D.findall(line)]
+            for d_, m_, y_ in found:
+                dd = _mkdate(d_, m_, y_, ref)
+                if dd and (dd, line.strip()[:80]) not in seen:
+                    seen.add((dd, line.strip()[:80]))
+                    out.append(dict(date=dd, text=line.strip()[:160], title=title, doc=did, ts=ts))
+    return sorted(out, key=lambda x: x["date"])
+
+
+def deadlines_ics(items) -> bytes:
+    esc = lambda t: t.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", " ")
+    out = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//SecondBrain//UA"]
+    for d in items:
+        uid = hashlib.md5(f"{d['date']}{d['text']}".encode()).hexdigest()
+        out += ["BEGIN:VEVENT", f"UID:{uid}@secondbrain", f"DTSTAMP:{dt.datetime.now():%Y%m%dT%H%M%S}",
+                f"DTSTART;VALUE=DATE:{d['date']:%Y%m%d}", f"SUMMARY:{esc('Дедлайн: ' + d['text'][:80])}",
+                f"DESCRIPTION:{esc('З: ' + d['title'])}", "END:VEVENT"]
+    return ("\r\n".join(out + ["END:VCALENDAR"]) + "\r\n").encode("utf-8")
 
 
 # ---------- дайджест ----------
@@ -706,7 +773,21 @@ with tab_dig:
     if not rec:
         st.caption("За цей період нових документів немає.")
 
-    st.subheader("✅ Домовленості та дедлайни")
+    st.subheader("⏰ Дедлайни з листів і нотаток")
+    vsig = str(vault.db.execute("SELECT COUNT(*), COALESCE(MAX(ts),0), COALESCE(SUM(rowid),0) FROM docs").fetchone())
+    today, dls = dt.date.today(), deadline_index(vault, vsig)
+    over = [d for d in dls if today - dt.timedelta(days=14) <= d["date"] < today]
+    soon = [d for d in dls if today <= d["date"] <= today + dt.timedelta(days=60)]
+    for d in over:
+        st.markdown(f"⚠️ **{d['date']:%d.%m}** (минуло {(today - d['date']).days} дн.) — {d['text']} · _{d['title'][:50]}_")
+    for d in soon:
+        st.markdown(f"**{WD[d['date'].weekday()]} {d['date']:%d.%m}** (через {(d['date'] - today).days} дн.) — {d['text']} · _{d['title'][:50]}_")
+    if soon:
+        st.download_button("⬇️ Додати дедлайни в календар (.ics)", deadlines_ics(soon), "deadlines.ics", "text/calendar")
+    if not (over or soon):
+        st.caption("Дат дедлайнів у найближчі 60 днів не знайдено.")
+
+    st.subheader("✅ Домовленості та завдання")
     st.caption("Шукає у листах і нотатках за період фрази про домовленості, терміни й завдання.")
     if st.button("Знайти домовленості", key="dig_btn"):
         rows = vault.db.execute(
@@ -783,3 +864,34 @@ with tab_ppl:
             for a, b, c, x in docs[:50]:
                 with st.expander(f"{fmt(c)} · {SRC.get(a, a)} · {b[:80]}"):
                     st.text(x[:1200])
+
+
+# ---------- хронологія ----------
+with tab_tl:
+    topic = st.text_input("Тема або ключові слова", key="tl_topic", placeholder="напр.: постачальник Іваненко знижка")
+    if topic:
+        trng = manual_rng or parse_dates(topic)
+        thits = sorted(search(vault, topic, emb, 30, kinds, trng), key=lambda h: h["ts"])
+        for i, h in enumerate(thits):
+            h["n"] = i + 1
+        if not thits:
+            st.info("Нічого не знайшлося.")
+        else:
+            st.caption(f"Знайдено фрагментів: {len(thits)} · від {fmt(thits[0]['ts'])} до {fmt(thits[-1]['ts'])}")
+            for h in thits:
+                st.markdown(f"**{fmt(h['ts'])}** · {SRC.get(h['source'], h['source'])} · {h['title'][:80]}")
+                st.caption(h["text"].split("\n", 1)[-1][:300].replace("\n", " "))
+            if st.button("🔎 Знайти зміни й суперечності", key="tl_btn"):
+                if provider == "none":
+                    st.info("Оберіть модель у бічній панелі — порівняння виконує LLM.")
+                else:
+                    try:
+                        with st.spinner("Порівнюю…"):
+                            ans, sent = ask_llm("Фрагменти подано в хронологічному порядку. Опиши, як із часом змінювалися "
+                                                "умови, суми, дати й рішення; чітко вкажи будь-які суперечності між джерелами. "
+                                                "Якщо суперечностей немає — так і скажи.", thits[:20], [], provider, model, redact, host)
+                        st.markdown(ans)
+                        if sent:
+                            show_sent(sent)
+                    except Exception as e:
+                        st.error(f"Помилка моделі: {e}")
