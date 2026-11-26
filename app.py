@@ -321,13 +321,15 @@ def secret(name: str):
         return None
 
 
-def ask_llm(q, hits, history, provider, model, redact, host, style="standard"):
+def ask_llm(q, hits, history, provider, model, redact, host, style="standard", today=None):
     red = Redactor() if (redact and provider == "anthropic") else (lambda s: s)
     ctx = "\n".join(f'<source n="{h["n"]}" type="{h["source"]}">\n{red(h["text"])}\n</source>' for h in hits)
     hist = "\n".join(f'{"Користувач" if m["role"] == "user" else "Асистент"}: {red(m["content"][:600])}'
                      for m in history[-6:])
     user = f"{ctx}\n\n" + (f"Попередня розмова:\n{hist}\n\n" if hist else "") + f"Питання: {red(q)}"
-    system = SYSTEM.format(today=dt.date.today().isoformat()) + ("\n- " + STYLES[style] if STYLES.get(style) else "")
+    system = (SYSTEM.format(today=today or dt.date.today().isoformat())
+              + ("\n- " + STYLES[style] if STYLES.get(style) else "")
+              + ("\n- Це «машина часу»: відповідай лише з того, що відомо з джерел, і не припускай подій пізніше за цю дату." if today else ""))
     if provider == "anthropic":
         import anthropic
         r = anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY")).messages.create(
@@ -545,8 +547,8 @@ if vault.stats() and vault.kind() not in (None, emb.name):
     if st.button("Переіндексувати"):
         bar = st.progress(0.0); vault.reindex(emb, bar.progress); vault.save(); st.rerun()
 
-tab_chat, tab_dig, tab_src, tab_arch, tab_ppl, tab_tl = st.tabs(
-    ["💬 Питання", "📰 Дайджест", "📥 Джерела", "🗂 Архів", "👥 Люди", "🕰 Хронологія"])
+tab_chat, tab_dig, tab_src, tab_arch, tab_ppl, tab_tl, tab_map, tab_tm = st.tabs(
+    ["💬 Питання", "📰 Дайджест", "📥 Джерела", "🗂 Архів", "👥 Люди", "🕰 Хронологія", "🕸 Мапа", "⏳ Машина часу"])
 
 # ---------- чат ----------
 def show_sources(hits):
@@ -582,7 +584,7 @@ def demo_docs():
     dm = lambda days: (now + dt.timedelta(days=days)).strftime("%d.%m")
     IV, ME = "Іван Петренко <ivan.petrenko@postach.example>", "Я <me@example.com>"
     OL, MA = "Олена Коваль <olena.koval@logistika.example>", "Марія Шевченко <maria@firma.example>"
-    mail = lambda frm, to, text: f"Від: {frm}\nКому: {to}\nКопія: \n\n{text}"
+    mail = lambda frm, to, text, cc="": f"Від: {frm}\nКому: {to}\nКопія: {cc}\n\n{text}"
     cal = lambda title, ts, place, att: (f"Подія: {title}\nКоли: {dt.datetime.fromtimestamp(ts):%Y-%m-%d %H:%M}\n"
                                          f"Де: {place}\nУчасники: {att}\n\n")
     ev1, ev2 = ahead(2, 11), ahead(5, 15)
@@ -594,19 +596,19 @@ def demo_docs():
             "Іване, дякую. Готові взяти 10 000 одиниць, якщо знижка буде 7% і оплата через 30 днів після поставки."), at(3, 12)),
         ("demo:m3", "mail", "Умови поставки погоджено", mail(IV, ME,
             "Домовились: 10 000 одиниць, ціна 12,40 грн, знижка 7%, оплата протягом 30 днів після поставки, "
-            "доставка на склад у Вінниці до 28 березня. Рахунок надішлемо до 18 березня."), at(3, 14)),
+            "доставка на склад у Вінниці до 28 березня. Рахунок надішлемо до 18 березня.", MA), at(3, 14)),
         ("demo:m4", "mail", "Зміна терміну доставки", mail(IV, ME,
             "Через затримку на митниці доставка переноситься на 2 квітня. Знижка 7% зберігається."), at(3, 20)),
         ("demo:m5", "mail", "Рахунок №214", mail(IV, ME,
-            "Додаємо рахунок на 115 320 грн (з урахуванням знижки 7%). Оплата не пізніше 3 травня."), at(4, 3)),
+            "Додаємо рахунок на 115 320 грн (з урахуванням знижки 7%). Оплата не пізніше 3 травня.", MA), at(4, 3)),
         ("demo:m6", "mail", "Пропозиція на перевезення Вінниця — Київ", mail(OL, ME,
-            f"Пропонуємо перевезення від 9 500 грн за рейс. Просимо підтвердити до {dm(7)}."), ago(3)),
+            f"Пропонуємо перевезення від 9 500 грн за рейс. Просимо підтвердити до {dm(7)}.", IV), ago(3)),
         ("demo:m7", "mail", "Нагадування про квартальний звіт", mail(MA, ME,
             f"Нагадую: квартальний звіт потрібно здати не пізніше {dm(12)}. Чекаю цифри по продажах."), ago(1)),
         ("demo:c1", "calendar", "Дзвінок із постачальником", cal("Дзвінок із постачальником", ev1, "Zoom",
             "ivan.petrenko@postach.example"), ev1),
         ("demo:c2", "calendar", "Зустріч із логістикою", cal("Зустріч із логістикою", ev2, "Офіс, Вінниця",
-            "olena.koval@logistika.example"), ev2),
+            "olena.koval@logistika.example, ivan.petrenko@postach.example"), ev2),
         ("demo:n1", "note", "Ідеї для проєкту",
             "Перевірити альтернативного постачальника упаковки. Порівняти ціни: Postach — 12,40 грн, інші — 11,90–13,10 грн.", ago(6)),
         ("demo:n2", "note", "Особисті справи", "Купити фільтр для води. Записатися до стоматолога.", ago(4)),
@@ -1425,3 +1427,167 @@ with tab_dig:
                             show_sent(sent)
                     except Exception as e:
                         st.error(f"Помилка моделі: {e}")
+
+
+# =====================================================================
+# 7. Ізюминки: 🕸 Мапа зв'язків і ⏳ Машина часу
+# =====================================================================
+def onboarding_map(has_docs: bool):
+    st.subheader("🕸 Мапа зв'язків")
+    st.write("Тут ви побачите, хто з ким пов'язаний у вашому архіві: вузли — люди, лінії — спільні листи й події.")
+    if has_docs:
+        st.info("Для мапи потрібні щонайменше двоє людей в адресах листів чи учасниках подій. "
+                "Імпортуйте пошту або календар у «Джерелах».")
+    else:
+        st.caption("Завантажте демо — і мапа побудується одразу.")
+        quick_start("map")
+
+
+def onboarding_tm():
+    st.subheader("⏳ Машина часу")
+    st.write("Поставте питання й оберіть дату в минулому. Ви побачите, **що ви знали тоді**, що відомо **тепер** і "
+             "**що змінилося** — умови, суми, терміни, рішення.")
+    c1, c2, c3 = st.columns(3)
+    for col, (t, d) in zip((c1, c2, c3), (("📜 Тоді", "Відповідь лише з документів, що існували на обрану дату."),
+                                          ("🆕 Тепер", "Відповідь з усього архіву на сьогодні."),
+                                          ("🔀 Різниця", "Модель зіставляє обидві відповіді й виділяє зміни."))):
+        with col.container(border=True):
+            st.markdown(f"#### {t}")
+            st.caption(d)
+    st.caption("Приклад: «які умови доставки?» станом на середину березня і зараз.")
+    quick_start("tm")
+
+
+def brief(h):
+    st.markdown(f"**{fmt(h['ts'])}** · {SRC.get(h['source'], h['source'])} · {h['title'][:80]}")
+    st.caption(h["text"].split("\n", 1)[-1][:240].replace("\n", " "))
+
+
+# ---------- мапа зв'язків ----------
+with tab_map:
+    msig = str(vault.db.execute("SELECT COUNT(*), COALESCE(MAX(ts),0), COALESCE(SUM(rowid),0) FROM docs").fetchone())
+    ppl = people_index(vault, msig)
+    if len(ppl) < 2:
+        onboarding_map(bool(vault.stats()))
+    else:
+        st.subheader("🕸 Мапа зв'язків")
+        st.caption("Вузли — люди (у дужках кількість взаємодій), лінії — скільки разів вони були разом в одному листі чи події.")
+        top = sorted(ppl.values(), key=lambda p: -p["n"])
+        m1, m2, m3 = st.columns(3)
+        n_nodes = m1.slider("Скільки людей", 5, 40, 15, key="map_n")
+        min_w = m2.slider("Мінімум спільних документів", 1, 10, 1, key="map_w")
+        hide = m3.selectbox("Приховати вузол", ["—"] + [p["email"] for p in top[:10]], index=1 if len(top) > 2 else 0,
+                            key="map_hide", help="За замовчуванням ховається найактивніший контакт — зазвичай це ви: "
+                                                 "інакше всі лінії сходяться до вас.")
+        show_iso = st.checkbox("Показувати людей без зв'язків", True, key="map_iso")
+        sel = [p for p in top if p["email"] != hide][:n_nodes]
+        sets = {p["email"]: set(p["docs"]) for p in sel}
+        edges = [(a, b, len(sets[a["email"]] & sets[b["email"]])) for i, a in enumerate(sel) for b in sel[i + 1:]]
+        edges = [e for e in edges if e[2] >= min_w]
+        linked = {e[0]["email"] for e in edges} | {e[1]["email"] for e in edges}
+        nodes = [p for p in sel if show_iso or p["email"] in linked]
+        lab = lambda p: (p["name"] or p["email"].split("@")[0]).replace('"', "'")
+        mx = max((p["n"] for p in nodes), default=1)
+        dot = ["graph G {", 'graph [bgcolor="transparent", overlap=false, splines=true];',
+               'node [shape=ellipse, style=filled, fillcolor="#e8eefc", color="#5b7bd5", fontname="Helvetica"];',
+               'edge [color="#9aa7c7", fontname="Helvetica", fontsize=10];']
+        dot += [f'"{p["email"]}" [label="{lab(p)}\\n({p["n"]})", fontsize={10 + int(10 * p["n"] / mx)}];' for p in nodes]
+        dot += [f'"{a["email"]}" -- "{b["email"]}" [penwidth={1 + min(w, 8)}, label="{w}"];' for a, b, w in edges]
+        dot.append("}")
+        k1, k2 = st.columns(2)
+        k1.metric("Людей на мапі", len(nodes))
+        k2.metric("Зв'язків", len(edges))
+        st.graphviz_chart("\n".join(dot))
+        if edges:
+            st.markdown("**Найтісніші зв'язки**")
+            st.dataframe(pd.DataFrame([dict(Пара=f"{lab(a)} ↔ {lab(b)}", Спільних=w)
+                                       for a, b, w in sorted(edges, key=lambda e: -e[2])[:10]]), hide_index=True)
+        else:
+            st.info("За цими порогами зв'язків немає — зменште мінімум спільних документів.")
+
+# ---------- машина часу ----------
+with tab_tm:
+    if not vault.stats():
+        onboarding_tm()
+    else:
+        st.subheader("⏳ Машина часу")
+        st.write("Що ви знали **тоді**, що відомо **тепер** і **що змінилося**.")
+        all_ts = [r[0] for r in vault.db.execute("SELECT ts FROM docs ORDER BY ts")]
+        lo_d, today_d = dt.date.fromtimestamp(all_ts[0]), dt.date.today()
+        st.session_state.setdefault("tm_date", max(lo_d, dt.date.fromtimestamp(all_ts[len(all_ts) // 4])))
+        clamp = lambda d_: max(lo_d, min(d_, today_d))
+        q_tm = st.text_input("Питання або тема", key="tm_q", placeholder="напр.: які умови доставки?")
+        t1, t2 = st.columns([2, 3])
+        d_cut = t1.date_input("Станом на", key="tm_date", min_value=lo_d, max_value=today_d)
+        t2.caption("Швидкий вибір:")
+        pr = t2.columns(3)
+        for col, (name, days_) in zip(pr, (("3 міс. тому", 90), ("півроку тому", 183), ("рік тому", 365))):
+            col.button(name, key=f"tm_p{days_}",
+                       on_click=lambda d_=days_: st.session_state.update(tm_date=clamp(today_d - dt.timedelta(days=d_))))
+        cut_ts = dt.datetime.combine(d_cut + dt.timedelta(days=1), dt.time()).timestamp()
+        n_then = sum(1 for t in all_ts if t < cut_ts)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Було в архіві тоді", n_then)
+        c2.metric("З'явилося відтоді", len(all_ts) - n_then)
+        c3.metric("Ви знали", f"{n_then * 100 // len(all_ts)}% архіву")
+        if provider != "none":
+            st.caption("Режим із моделлю робить 3 запити: відповідь тоді, відповідь тепер і порівняння.")
+
+        if st.button("🚀 Перенестися", key="tm_go", type="primary") and q_tm.strip():
+            then_h = search(vault, q_tm, emb, top_k, kinds, (0.0, cut_ts))
+            now_h = search(vault, q_tm, emb, top_k, kinds, None)
+            res = dict(q=q_tm, d=d_cut, then=then_h, now=now_h, new=[h for h in now_h if h["ts"] >= cut_ts])
+            if provider != "none" and (then_h or now_h):
+                try:
+                    with st.spinner("Подорожую в часі…"):
+                        sents = []
+                        if then_h:
+                            res["ans_then"], s1 = ask_llm(q_tm, then_h, [], provider, model, redact, host, today=d_cut.isoformat())
+                        else:
+                            res["ans_then"], s1 = "На ту дату в архіві про це нічого не було.", None
+                        res["ans_now"], s2 = ask_llm(q_tm, now_h, [], provider, model, redact, host)
+                        pair = [dict(n=1, source="note", title=f"Відповідь станом на {d_cut:%d.%m.%Y}", ts=cut_ts, text=res["ans_then"]),
+                                dict(n=2, source="note", title="Відповідь тепер", ts=time.time(), text=res["ans_now"])]
+                        res["diff"], s3 = ask_llm("Порівняй дві відповіді на одне й те саме питання: що змінилося між ними "
+                                                  "(умови, суми, дати, рішення, учасники)? Коротко списком. "
+                                                  "Якщо змін немає — скажи прямо.", pair, [], provider, model, redact, host)
+                        res["sent"] = "\n\n=====\n\n".join(x for x in (s1, s2, s3) if x)
+                except Exception as e:
+                    res["error"] = str(e)
+            st.session_state.tm = res
+
+        res = st.session_state.get("tm")
+        if res:
+            st.divider()
+            st.markdown(f"**Питання:** {res['q']} · **станом на {res['d']:%d.%m.%Y}**")
+            if res.get("error"):
+                st.error(f"Помилка моделі: {res['error']}")
+            L, R = st.columns(2)
+            with L:
+                st.markdown(f"### 📜 Тоді")
+                if res.get("ans_then"):
+                    st.markdown(res["ans_then"])
+                    show_sources(res["then"])
+                elif res["then"]:
+                    for h in res["then"][:6]:
+                        brief(h)
+                else:
+                    st.info("На ту дату в архіві про це нічого не було.")
+            with R:
+                st.markdown("### 🆕 Тепер")
+                if res.get("ans_now"):
+                    st.markdown(res["ans_now"])
+                    show_sources(res["now"])
+                elif res["new"]:
+                    st.caption("Нове відтоді (без моделі показано фрагменти):")
+                    for h in res["new"][:6]:
+                        brief(h)
+                else:
+                    st.info("Після цієї дати нічого нового за темою не з'явилося.")
+            if res.get("diff"):
+                st.markdown("### 🔀 Що змінилося")
+                st.markdown(res["diff"])
+                if res.get("sent"):
+                    show_sent(res["sent"])
+            elif provider == "none" and res["new"]:
+                st.caption("Підключіть модель у бічній панелі, щоб отримати стислий підсумок змін.")
