@@ -1,0 +1,7 @@
+streamlit>=1.35
+cryptography>=42
+icalendar>=5.0
+requests>=2.31
+numpy>=1.26
+anthropic>=0.40            # для хмарної моделі (необов'язково, якщо Ollama)
+sentence-transformers>=3.0 # для семантичного пошуку (необов'язково, але дуже бажано)
