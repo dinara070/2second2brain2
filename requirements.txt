@@ -3,5 +3,8 @@ cryptography>=42
 icalendar>=5.0
 requests>=2.31
 numpy>=1.26
-anthropic>=0.40            # для хмарної моделі (необов'язково, якщо Ollama)
-sentence-transformers>=3.0 # для семантичного пошуку (необов'язково, але дуже бажано)
+pandas>=2.0
+anthropic>=0.40
+pypdf>=4.0
+# Необов'язково (важка нейромережа, на безкоштовному Streamlit Cloud може не вмістися в пам'ять):
+# sentence-transformers>=3.0
