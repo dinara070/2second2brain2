@@ -572,6 +572,178 @@ def pin_answer(i):
     st.toast("Збережено в пам'ять 📌")
 
 
+# ---------- порожні стани, демо-дані, швидкий старт ----------
+def demo_docs():
+    now = dt.datetime.now()
+    Y = now.year if now.month >= 3 else now.year - 1
+    at = lambda m, d, h=10: dt.datetime(Y, m, d, h).timestamp()
+    ago = lambda days: (now - dt.timedelta(days=days)).timestamp()
+    ahead = lambda days, h=11: (now.replace(hour=h, minute=0, second=0, microsecond=0) + dt.timedelta(days=days)).timestamp()
+    dm = lambda days: (now + dt.timedelta(days=days)).strftime("%d.%m")
+    IV, ME = "Іван Петренко <ivan.petrenko@postach.example>", "Я <me@example.com>"
+    OL, MA = "Олена Коваль <olena.koval@logistika.example>", "Марія Шевченко <maria@firma.example>"
+    mail = lambda frm, to, text: f"Від: {frm}\nКому: {to}\nКопія: \n\n{text}"
+    cal = lambda title, ts, place, att: (f"Подія: {title}\nКоли: {dt.datetime.fromtimestamp(ts):%Y-%m-%d %H:%M}\n"
+                                         f"Де: {place}\nУчасники: {att}\n\n")
+    ev1, ev2 = ahead(2, 11), ahead(5, 15)
+    return [
+        ("demo:m1", "mail", "Комерційна пропозиція на упаковку", mail(IV, ME,
+            "Добрий день! Надсилаємо пропозицію на партію упаковки: 5 000 одиниць по 12,40 грн. "
+            "Знижка 5% діє при замовленні від 10 000 одиниць. Чекаємо на вашу відповідь."), at(3, 4)),
+        ("demo:m2", "mail", "Re: Комерційна пропозиція на упаковку", mail(ME, IV,
+            "Іване, дякую. Готові взяти 10 000 одиниць, якщо знижка буде 7% і оплата через 30 днів після поставки."), at(3, 12)),
+        ("demo:m3", "mail", "Умови поставки погоджено", mail(IV, ME,
+            "Домовились: 10 000 одиниць, ціна 12,40 грн, знижка 7%, оплата протягом 30 днів після поставки, "
+            "доставка на склад у Вінниці до 28 березня. Рахунок надішлемо до 18 березня."), at(3, 14)),
+        ("demo:m4", "mail", "Зміна терміну доставки", mail(IV, ME,
+            "Через затримку на митниці доставка переноситься на 2 квітня. Знижка 7% зберігається."), at(3, 20)),
+        ("demo:m5", "mail", "Рахунок №214", mail(IV, ME,
+            "Додаємо рахунок на 115 320 грн (з урахуванням знижки 7%). Оплата не пізніше 3 травня."), at(4, 3)),
+        ("demo:m6", "mail", "Пропозиція на перевезення Вінниця — Київ", mail(OL, ME,
+            f"Пропонуємо перевезення від 9 500 грн за рейс. Просимо підтвердити до {dm(7)}."), ago(3)),
+        ("demo:m7", "mail", "Нагадування про квартальний звіт", mail(MA, ME,
+            f"Нагадую: квартальний звіт потрібно здати не пізніше {dm(12)}. Чекаю цифри по продажах."), ago(1)),
+        ("demo:c1", "calendar", "Дзвінок із постачальником", cal("Дзвінок із постачальником", ev1, "Zoom",
+            "ivan.petrenko@postach.example"), ev1),
+        ("demo:c2", "calendar", "Зустріч із логістикою", cal("Зустріч із логістикою", ev2, "Офіс, Вінниця",
+            "olena.koval@logistika.example"), ev2),
+        ("demo:n1", "note", "Ідеї для проєкту",
+            "Перевірити альтернативного постачальника упаковки. Порівняти ціни: Postach — 12,40 грн, інші — 11,90–13,10 грн.", ago(6)),
+        ("demo:n2", "note", "Особисті справи", "Купити фільтр для води. Записатися до стоматолога.", ago(4)),
+    ]
+
+
+def load_demo() -> int:
+    n = sum(vault.upsert(i, s_, t, b, ts, emb) for i, s_, t, b, ts in demo_docs())
+    vault.save()
+    return n
+
+
+def demo_banner(w):
+    n = vault.db.execute("SELECT COUNT(*) FROM docs WHERE id LIKE 'demo:%'").fetchone()[0]
+    if n:
+        c1, c2 = st.columns([4, 1])
+        c1.info(f"🧪 У сховищі {n} демо-документів. Спробуйте: «що ми домовлялися з постачальником у березні?»")
+        if c2.button("Видалити демо", key=f"{w}_rmdemo"):
+            for (d_,) in vault.db.execute("SELECT id FROM docs WHERE id LIKE 'demo:%'").fetchall():
+                vault.delete(d_)
+            vault.save(); st.rerun()
+
+
+def quick_start(w):
+    c1, c2, c3 = st.columns(3)
+    with c1.container(border=True):
+        st.markdown("#### 🧪 Демо-дані")
+        st.caption("11 вигаданих документів: листи з постачальником, події календаря, нотатки. Видаляються однією кнопкою.")
+        if st.button("Завантажити демо", key=f"{w}_demo", type="primary"):
+            load_demo(); st.rerun()
+    with c2.container(border=True):
+        st.markdown("#### 📄 Свої файли")
+        files = st.file_uploader("Файли", accept_multiple_files=True, type=["md", "txt", "pdf", "eml", "ics"],
+                                 key=f"{w}_files", label_visibility="collapsed")
+        if files and st.button("Додати файли", key=f"{w}_addf"):
+            for f in files:
+                try:
+                    ingest_file(vault, emb, f.name, f.read())
+                except Exception as e:
+                    st.error(f"{f.name}: {e}")
+            vault.save(); st.rerun()
+    with c3.container(border=True):
+        st.markdown("#### ✍️ Швидка нотатка")
+        t = st.text_input("Заголовок", key=f"{w}_nt")
+        b = st.text_area("Текст", key=f"{w}_nb", height=90)
+        if st.button("Зберегти", key=f"{w}_ns") and b.strip():
+            vault.upsert(f"note:manual:{hashlib.md5((t + b).encode()).hexdigest()[:10]}", "note", t or "Нотатка",
+                         b, time.time(), emb)
+            vault.save(); st.rerun()
+
+
+def checklist():
+    steps = [
+        (True, "Сховище створено й розблоковано", ""),
+        (bool(vault.stats()), "Додано хоча б одне джерело", "кнопки вище або вкладка «Джерела»"),
+        (provider != "none", "Підключено модель для відповідей",
+         "оберіть «Хмара (Claude)» і додайте `ANTHROPIC_API_KEY` у Manage app → Settings → Secrets. "
+         "Без моделі працює лише пошук фрагментів"),
+        ("backup" in st.session_state, "Зроблено резервну копію",
+         "бічна панель → «Підготувати резервну копію» (на Streamlit Cloud диск тимчасовий)"),
+    ]
+    for ok, title, hint in steps:
+        st.markdown(f"{'✅' if ok else '⬜'} **{title}**" + (f" — {hint}" if hint and not ok else ""))
+
+
+def onboarding_chat():
+    st.subheader("👋 Ваш другий мозок поки порожній")
+    st.write("Додайте дані — і зможете ставити питання природною мовою. Оберіть, з чого почати:")
+    quick_start("chat")
+    a, b = st.columns(2)
+    with a:
+        st.markdown("##### 💡 Що можна буде запитати")
+        st.markdown(
+            "- Що ми домовлялися з постачальником у березні?\n"
+            "- Коли дедлайн по квартальному звіту?\n"
+            "- Що я обіцяв Олені минулого тижня?\n"
+            "- Яка ціна була в комерційній пропозиції?\n"
+            "- Хто пропонував перевезення і за скільки?\n"
+            "- Що в моїх нотатках про альтернативних постачальників?")
+        st.caption("Розуміє «у березні», «вчора», «минулого тижня», «цього місяця», «у 2025 році».")
+    with b:
+        st.markdown("##### 🚦 Готовність")
+        checklist()
+    with st.expander("⚙️ Як це працює"):
+        st.markdown(
+            "1. Документи ріжуться на фрагменти, до кожного додається заголовок і дата.\n"
+            "2. Пошук поєднує ключові слова (BM25) і семантику (n-грами), результати зливаються.\n"
+            "3. Дата з питання («у березні») фільтрує архів.\n"
+            "4. Модель відповідає лише за знайденими фрагментами й ставить посилання `[n]`.")
+    with st.expander("🔐 Як захищено ваші дані"):
+        st.markdown(
+            "- Сховище зашифроване паролем (scrypt + Fernet) і розшифровується лише в пам'яті.\n"
+            "- Пошта читається лише для читання, пароль IMAP не зберігається.\n"
+            "- «Лише пошук» не надсилає нічого нікуди.\n"
+            "- У режимі Claude йдуть тільки знайдені фрагменти з маскуванням email, телефонів, IBAN і карток; "
+            "точний текст видно під відповіддю.")
+
+
+def onboarding_arch():
+    st.subheader("🗂 Архів поки порожній")
+    st.write("Тут буде каталог усього, що запам'ятав другий мозок: листи, події, нотатки й файли. Почніть із додавання даних:")
+    quick_start("arch")
+    m1, m2, m3 = st.columns(3)
+    for col, (name, how) in zip((m1, m2, m3), (("✉️ Листи", "IMAP у «Джерела» або файли .eml"),
+                                                ("📅 Події", "посилання iCal або файл .ics"),
+                                                ("📝 Нотатки", "файли .md/.txt/.pdf або швидка нотатка"))):
+        col.metric(name, 0)
+        col.caption(how)
+    st.markdown("##### 👀 Так виглядатиме архів")
+    prev = sorted(demo_docs(), key=lambda r: -r[4])[:6]
+    st.dataframe(pd.DataFrame([dict(Дата=fmt(ts), Тип=SRC.get(s_, s_), Назва=t) for _, s_, t, _, ts in prev]),
+                 hide_index=True)
+    st.caption("Це приклад, а не ваші дані.")
+    left, right = st.columns(2)
+    with left:
+        st.markdown("##### 🧰 Що вмітиме архів")
+        st.markdown(
+            "- графік документів за місяцями та статистика індексу\n"
+            "- фільтри за типом, заголовком, текстом і періодом\n"
+            "- масове видалення, експорт у CSV і Markdown\n"
+            "- редагування нотаток, підсумок документа, «Пов'язане»\n"
+            "- пошук і видалення дублікатів, очистка старих документів")
+    with right:
+        st.markdown("##### 📥 Звідки взяти дані")
+        with st.expander("Gmail та інша пошта"):
+            st.markdown("Для Gmail потрібен пароль застосунку (Google-акаунт → Безпека → Паролі застосунків; "
+                        "потрібна двоетапна автентифікація, назви пунктів можуть відрізнятися). "
+                        "У «Джерела» → «Пошта» вкажіть сервер `imap.gmail.com`, свою адресу й цей пароль.")
+        with st.expander("Календар"):
+            st.markdown("Google Calendar: налаштування календаря → «Інтеграція календаря» → секретна адреса "
+                        "у форматі iCal. Вставте її в «Джерела» → «Календар за посиланням» або експортуйте .ics "
+                        "і завантажте файлом. Посилання дає доступ до календаря, тож нікому його не передавайте.")
+        with st.expander("Нотатки"):
+            st.markdown("Obsidian, Notion, Apple Notes та ін.: експортуйте у Markdown чи TXT і завантажте файлами. "
+                        "PDF і листи .eml теж підтримуються.")
+
+
 STYLE_LABELS = {"standard": "Звичайно", "short": "Коротко", "detailed": "Детально", "actions": "Список дій"}
 
 
@@ -611,7 +783,9 @@ with tab_chat:
         style = p1.selectbox("Формат відповіді", list(STYLE_LABELS), format_func=STYLE_LABELS.get, key="q_style")
         contains = p2.text_input("Лише документи, де згадується", key="q_contains", placeholder="email або слово").strip()
     if not vault.stats():
-        st.info("Архів порожній — додайте дані у вкладці «Джерела». Можна почати з файлів, нотаток чи .ics.")
+        onboarding_chat()
+    else:
+        demo_banner("chat")
     for i, m in enumerate(st.session_state.messages):
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
@@ -739,8 +913,9 @@ with tab_src:
 with tab_arch:
     rows = vault.db.execute("SELECT id, source, title, ts FROM docs ORDER BY ts DESC").fetchall()
     if not rows:
-        st.write("Порожньо.")
+        onboarding_arch()
     else:
+        demo_banner("arch")
         df = pd.DataFrame(rows, columns=["id", "source", "title", "ts"])
         nch = vault.db.execute("SELECT COUNT(*), COALESCE(SUM(emb IS NOT NULL), 0) FROM chunks").fetchone()
         m1, m2, m3, m4 = st.columns(4)
