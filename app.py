@@ -1106,70 +1106,169 @@ def deadlines_ics(items) -> bytes:
     return ("\r\n".join(out + ["END:VCALENDAR"]) + "\r\n").encode("utf-8")
 
 
+# ---------- порожні стани та допоміжне для Дайджесту, Людей, Хронології ----------
+from collections import Counter
+
+
+def onboarding_digest():
+    st.subheader("📰 Дайджест оживе, щойно з'являться дані")
+    st.write("Тут ви бачитимете головне зі свого архіву без жодного питання:")
+    c1, c2, c3 = st.columns(3)
+    with c1.container(border=True):
+        st.markdown("#### 📅 Найближчі події")
+        st.caption("Зустрічі й дзвінки з календаря на 3–30 днів уперед, з місцем проведення.")
+    with c2.container(border=True):
+        st.markdown("#### ⏰ Дедлайни")
+        st.caption("Дати з фраз «до 15.12», «не пізніше 3 грудня». Прострочені позначаються ⚠️. Експорт в .ics.")
+    with c3.container(border=True):
+        st.markdown("#### 📄 Тижневий звіт")
+        st.caption("Зведення за період у Markdown: активні контакти, події, дедлайни. Опційно резюме від моделі.")
+    st.markdown("##### 👀 Приклад на демо-даних")
+    for _, _, t, _, ts in sorted((d for d in demo_docs() if d[1] == "calendar"), key=lambda r: r[4]):
+        d = dt.datetime.fromtimestamp(ts)
+        st.markdown(f"**{WD[d.weekday()]} {d:%d.%m %H:%M}** — {t}")
+    st.markdown("##### 🚀 Почніть із демо або своїх даних")
+    quick_start("dig")
+
+
+def onboarding_people(has_docs: bool):
+    st.subheader("👥 Тут з'являться ваші контакти")
+    st.write("Люди збираються автоматично із заголовків листів («Від», «Кому», «Копія») та учасників подій.")
+    c1, c2 = st.columns(2)
+    with c1.container(border=True):
+        st.markdown("#### 🔎 Профіль людини")
+        st.caption("Скільки було взаємодій, коли перша й остання, активність за місяцями, хронологія листування.")
+    with c2.container(border=True):
+        st.markdown("#### 💤 Давно не спілкувалися")
+        st.caption("Контакти, з якими було багато взаємодій, але вже довго тиша, щоб вчасно нагадати про себе.")
+    if has_docs:
+        st.info("У сховищі є документи, але без листів чи подій з адресами. Імпортуйте пошту (IMAP або .eml) "
+                "чи календар (.ics) у вкладці «Джерела».")
+    else:
+        quick_start("ppl")
+
+
+def timeline_hub():
+    st.subheader("🕰 Хронологія теми")
+    st.write("Введіть тему вище — побачите всі згадки в порядку дат і зможете перевірити, як змінювалися умови.")
+    if not vault.stats():
+        st.markdown("##### 👀 Приклад для теми «знижка постачальник»")
+        for _, s_, t, b, ts in sorted((d for d in demo_docs() if "знижк" in d[3].lower()), key=lambda r: r[4]):
+            st.markdown(f"**{fmt(ts)}** · {SRC.get(s_, s_)} · {t}")
+            st.caption(b.split("\n\n", 1)[-1][:160])
+        st.caption("Це приклад на демо-даних.")
+        quick_start("tl")
+        return
+    skip = STOP | {"нагадування", "пропозиція", "пропозиції", "рахунок"}
+    words = Counter(w for (t,) in vault.db.execute("SELECT title FROM docs WHERE source != 'calendar'")
+                    for w in re.findall(r"\w{5,}", t.lower()) if w not in skip)
+    if words:
+        st.caption("Часті теми у вашому архіві — натисніть, щоб побудувати хронологію:")
+        cols = st.columns(3)
+        for i, (w, _) in enumerate(words.most_common(6)):
+            cols[i % 3].button(w, key=f"tlc{i}", on_click=lambda w=w: st.session_state.update(tl_topic=w))
+
+
+def profile(p, docs):
+    now = time.time()
+    tss = [d[2] for d in docs]
+    past = [t for t in tss if t <= now]
+    c = st.columns(4)
+    c[0].metric("Взаємодій", len(docs))
+    c[1].metric("Перша", fmt(min(tss)))
+    c[2].metric("Остання", fmt(max(past)) if past else "—")
+    c[3].metric("Днів тиші", int((now - max(past)) // 86400) if past else "—")
+    kinds = Counter(d[0] for d in docs)
+    st.caption(" · ".join(f"{SRC.get(k, k)}: {v}" for k, v in kinds.items()) + (" · є майбутні події" if len(past) < len(tss) else ""))
+    st.bar_chart(pd.Series(pd.to_datetime(tss, unit="s").strftime("%Y-%m")).value_counts().sort_index())
+
+
+def stale_contacts(people):
+    with st.expander("💤 Давно не спілкувалися"):
+        s1, s2 = st.columns(2)
+        n_days = s1.slider("Тиша довша за, днів", 14, 365, 60, key="stale_days")
+        min_n = s2.slider("Мінімум взаємодій", 2, 20, 3, key="stale_min")
+        now = time.time()
+        tsmap = dict(vault.db.execute("SELECT id, ts FROM docs"))
+        rows = []
+        for p in people.values():
+            past = [tsmap[d] for d in p["docs"] if d in tsmap and tsmap[d] <= now]
+            if past and p["n"] >= min_n and (now - max(past)) / 86400 >= n_days:
+                rows.append(dict(Ім_я=p["name"], Email=p["email"], Взаємодій=p["n"],
+                                 Остання=fmt(max(past)), Днів_тиші=int((now - max(past)) // 86400)))
+        if rows:
+            st.dataframe(pd.DataFrame(sorted(rows, key=lambda r: -r["Взаємодій"])[:50]), hide_index=True)
+        else:
+            st.caption("За цими порогами таких контактів немає.")
+
+
 # ---------- дайджест ----------
 WD = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд")
 KW = re.compile(r"(домов|погодили|узгод|дедлайн|термін|не пізніше|до \d{1,2}[./]\d{1,2}|потрібно|треба|обіця|надішл|оплат)", re.I)
 
 with tab_dig:
-    days = st.slider("Горизонт, днів (уперед для подій, назад для листів)", 3, 30, 14, key="dig_days")
-    now = dt.datetime.now().timestamp()
-    st.subheader("📅 Найближчі події")
-    ev = vault.db.execute("SELECT title, ts, body FROM docs WHERE source='calendar' AND ts>=? AND ts<? ORDER BY ts LIMIT 50",
-                          (now, now + days * 86400)).fetchall()
-    for t, ts, b in ev:
-        d = dt.datetime.fromtimestamp(ts)
-        place = re.search(r"Де: (.+)", b)
-        st.markdown(f"**{WD[d.weekday()]} {d:%d.%m %H:%M}** — {t}" + (f" · 📍 {place.group(1)}" if place else ""))
-    if not ev:
-        st.caption("Подій на цей період немає (імпортуйте .ics у «Джерелах»).")
+    if not vault.stats():
+        onboarding_digest()
+    else:
+        days = st.slider("Горизонт, днів (уперед для подій, назад для листів)", 3, 30, 14, key="dig_days")
+        now = dt.datetime.now().timestamp()
+        st.subheader("📅 Найближчі події")
+        ev = vault.db.execute("SELECT title, ts, body FROM docs WHERE source='calendar' AND ts>=? AND ts<? ORDER BY ts LIMIT 50",
+                              (now, now + days * 86400)).fetchall()
+        for t, ts, b in ev:
+            d = dt.datetime.fromtimestamp(ts)
+            place = re.search(r"Де: (.+)", b)
+            st.markdown(f"**{WD[d.weekday()]} {d:%d.%m %H:%M}** — {t}" + (f" · 📍 {place.group(1)}" if place else ""))
+        if not ev:
+            st.caption("Подій на цей період немає (імпортуйте .ics у «Джерелах»).")
 
-    st.subheader("🕑 Нове в архіві")
-    rec = vault.db.execute("SELECT source, title, ts FROM docs WHERE source!='calendar' AND ts>=? ORDER BY ts DESC LIMIT 15",
-                           (now - days * 86400,)).fetchall()
-    for s_, t, ts in rec:
-        st.markdown(f"{SRC.get(s_, s_)} · **{t[:90]}** · {fmt(ts)}")
-    if not rec:
-        st.caption("За цей період нових документів немає.")
+        st.subheader("🕑 Нове в архіві")
+        rec = vault.db.execute("SELECT source, title, ts FROM docs WHERE source!='calendar' AND ts>=? ORDER BY ts DESC LIMIT 15",
+                               (now - days * 86400,)).fetchall()
+        for s_, t, ts in rec:
+            st.markdown(f"{SRC.get(s_, s_)} · **{t[:90]}** · {fmt(ts)}")
+        if not rec:
+            st.caption("За цей період нових документів немає.")
 
-    st.subheader("⏰ Дедлайни з листів і нотаток")
-    vsig = str(vault.db.execute("SELECT COUNT(*), COALESCE(MAX(ts),0), COALESCE(SUM(rowid),0) FROM docs").fetchone())
-    today, dls = dt.date.today(), deadline_index(vault, vsig)
-    over = [d for d in dls if today - dt.timedelta(days=14) <= d["date"] < today]
-    soon = [d for d in dls if today <= d["date"] <= today + dt.timedelta(days=60)]
-    for d in over:
-        st.markdown(f"⚠️ **{d['date']:%d.%m}** (минуло {(today - d['date']).days} дн.) — {d['text']} · _{d['title'][:50]}_")
-    for d in soon:
-        st.markdown(f"**{WD[d['date'].weekday()]} {d['date']:%d.%m}** (через {(d['date'] - today).days} дн.) — {d['text']} · _{d['title'][:50]}_")
-    if soon:
-        st.download_button("⬇️ Додати дедлайни в календар (.ics)", deadlines_ics(soon), "deadlines.ics", "text/calendar")
-    if not (over or soon):
-        st.caption("Дат дедлайнів у найближчі 60 днів не знайдено.")
+        st.subheader("⏰ Дедлайни з листів і нотаток")
+        vsig = str(vault.db.execute("SELECT COUNT(*), COALESCE(MAX(ts),0), COALESCE(SUM(rowid),0) FROM docs").fetchone())
+        today, dls = dt.date.today(), deadline_index(vault, vsig)
+        over = [d for d in dls if today - dt.timedelta(days=14) <= d["date"] < today]
+        soon = [d for d in dls if today <= d["date"] <= today + dt.timedelta(days=60)]
+        for d in over:
+            st.markdown(f"⚠️ **{d['date']:%d.%m}** (минуло {(today - d['date']).days} дн.) — {d['text']} · _{d['title'][:50]}_")
+        for d in soon:
+            st.markdown(f"**{WD[d['date'].weekday()]} {d['date']:%d.%m}** (через {(d['date'] - today).days} дн.) — {d['text']} · _{d['title'][:50]}_")
+        if soon:
+            st.download_button("⬇️ Додати дедлайни в календар (.ics)", deadlines_ics(soon), "deadlines.ics", "text/calendar")
+        if not (over or soon):
+            st.caption("Дат дедлайнів у найближчі 60 днів не знайдено.")
 
-    st.subheader("✅ Домовленості та завдання")
-    st.caption("Шукає у листах і нотатках за період фрази про домовленості, терміни й завдання.")
-    if st.button("Знайти домовленості", key="dig_btn"):
-        rows = vault.db.execute(
-            "SELECT d.source, d.title, d.ts, c.text FROM chunks c JOIN docs d ON d.id=c.doc_id "
-            "WHERE d.source IN ('mail','note') AND d.ts>=? ORDER BY d.ts DESC LIMIT 400", (now - days * 86400,)).fetchall()
-        picked = [r for r in rows if KW.search(r[3])][:20]
-        hits = [dict(n=i + 1, source=a, title=b, ts=c, text=x[:700]) for i, (a, b, c, x) in enumerate(picked)]
-        if not hits:
-            st.info("Нічого схожого на домовленості за цей період.")
-        elif provider == "none":
-            for h in hits:
-                lines = [l.strip() for l in h["text"].splitlines() if KW.search(l)][:3]
-                st.markdown(f"**[{h['n']}] {h['title']}** ({fmt(h['ts'])})\n" + "\n".join(f"- {l}" for l in lines))
-        else:
-            try:
-                with st.spinner("Аналізую…"):
-                    ans, sent = ask_llm("Випиши списком усі домовленості, обіцянки, завдання та дедлайни (з датами й "
-                                        "учасниками). Згрупуй за людьми або проєктами.", hits, [], provider, model, redact, host)
-                st.markdown(ans)
-                if sent:
-                    show_sent(sent)
-                show_sources(hits)
-            except Exception as e:
-                st.error(f"Помилка моделі: {e}")
+        st.subheader("✅ Домовленості та завдання")
+        st.caption("Шукає у листах і нотатках за період фрази про домовленості, терміни й завдання.")
+        if st.button("Знайти домовленості", key="dig_btn"):
+            rows = vault.db.execute(
+                "SELECT d.source, d.title, d.ts, c.text FROM chunks c JOIN docs d ON d.id=c.doc_id "
+                "WHERE d.source IN ('mail','note') AND d.ts>=? ORDER BY d.ts DESC LIMIT 400", (now - days * 86400,)).fetchall()
+            picked = [r for r in rows if KW.search(r[3])][:20]
+            hits = [dict(n=i + 1, source=a, title=b, ts=c, text=x[:700]) for i, (a, b, c, x) in enumerate(picked)]
+            if not hits:
+                st.info("Нічого схожого на домовленості за цей період.")
+            elif provider == "none":
+                for h in hits:
+                    lines = [l.strip() for l in h["text"].splitlines() if KW.search(l)][:3]
+                    st.markdown(f"**[{h['n']}] {h['title']}** ({fmt(h['ts'])})\n" + "\n".join(f"- {l}" for l in lines))
+            else:
+                try:
+                    with st.spinner("Аналізую…"):
+                        ans, sent = ask_llm("Випиши списком усі домовленості, обіцянки, завдання та дедлайни (з датами й "
+                                            "учасниками). Згрупуй за людьми або проєктами.", hits, [], provider, model, redact, host)
+                    st.markdown(ans)
+                    if sent:
+                        show_sent(sent)
+                    show_sources(hits)
+                except Exception as e:
+                    st.error(f"Помилка моделі: {e}")
 
 # ---------- люди ----------
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
@@ -1193,18 +1292,20 @@ with tab_ppl:
     sig = vault.db.execute("SELECT COUNT(*), COALESCE(MAX(ts),0), COALESCE(SUM(rowid),0) FROM docs").fetchone()
     people = people_index(vault, str(sig))
     if not people:
-        st.write("Контактів поки немає — синхронізуйте пошту або календар.")
+        onboarding_people(bool(vault.stats()))
     else:
         flt = st.text_input("Пошук людини (ім'я або email)", key="ppl_flt").lower()
         lst = sorted((p for p in people.values() if flt in (p["email"] + p["name"]).lower()), key=lambda p: -p["n"])[:200]
         if lst:
             st.dataframe(pd.DataFrame([dict(Ім_я=p["name"], Email=p["email"], Листів_і_подій=p["n"], Останнє=fmt(p["last"]))
                                        for p in lst]), hide_index=True)
+            stale_contacts(people)
             who = st.selectbox("Хронологія спілкування", [p["email"] for p in lst],
                                format_func=lambda e: f"{people[e]['name'] or e} · {e}")
             ids = people[who]["docs"]
             docs = vault.db.execute(f"SELECT source, title, ts, body FROM docs WHERE id IN ({','.join('?' * len(ids))}) "
                                     f"ORDER BY ts DESC", ids).fetchall()
+            profile(people[who], docs)
             if st.button("🧾 Підсумувати, про що ми домовлялися", key="ppl_sum"):
                 if provider == "none":
                     st.info("Оберіть модель у бічній панелі — підсумок формує LLM.")
@@ -1227,18 +1328,31 @@ with tab_ppl:
 # ---------- хронологія ----------
 with tab_tl:
     topic = st.text_input("Тема або ключові слова", key="tl_topic", placeholder="напр.: постачальник Іваненко знижка")
+    if not topic:
+        timeline_hub()
     if topic:
+        tl_k = st.slider("Скільки фрагментів шукати", 10, 60, 30, key="tl_k")
         trng = manual_rng or parse_dates(topic)
-        thits = sorted(search(vault, topic, emb, 30, kinds, trng), key=lambda h: h["ts"])
+        thits = sorted(search(vault, topic, emb, tl_k, kinds, trng), key=lambda h: h["ts"])
         for i, h in enumerate(thits):
             h["n"] = i + 1
         if not thits:
             st.info("Нічого не знайшлося.")
         else:
             st.caption(f"Знайдено фрагментів: {len(thits)} · від {fmt(thits[0]['ts'])} до {fmt(thits[-1]['ts'])}")
+            st.bar_chart(pd.Series(pd.to_datetime([h["ts"] for h in thits], unit="s").strftime("%Y-%m")).value_counts().sort_index())
+            cur = None
             for h in thits:
+                mk = dt.datetime.fromtimestamp(h["ts"]).strftime("%Y-%m")
+                if mk != cur:
+                    cur = mk
+                    st.markdown(f"##### {mk}")
                 st.markdown(f"**{fmt(h['ts'])}** · {SRC.get(h['source'], h['source'])} · {h['title'][:80]}")
                 st.caption(h["text"].split("\n", 1)[-1][:300].replace("\n", " "))
+            md_tl = f"# Хронологія: {topic}\n\n" + "\n\n".join(
+                f"**{fmt(h['ts'])}** · {SRC.get(h['source'], h['source'])} · {h['title']}\n\n{h['text'].split(chr(10), 1)[-1][:500]}"
+                for h in thits)
+            st.download_button("⬇️ Експорт хронології (.md)", md_tl, "timeline.md")
             if st.button("🔎 Знайти зміни й суперечності", key="tl_btn"):
                 if provider == "none":
                     st.info("Оберіть модель у бічній панелі — порівняння виконує LLM.")
@@ -1248,6 +1362,64 @@ with tab_tl:
                             ans, sent = ask_llm("Фрагменти подано в хронологічному порядку. Опиши, як із часом змінювалися "
                                                 "умови, суми, дати й рішення; чітко вкажи будь-які суперечності між джерелами. "
                                                 "Якщо суперечностей немає — так і скажи.", thits[:20], [], provider, model, redact, host)
+                        st.markdown(ans)
+                        if sent:
+                            show_sent(sent)
+                    except Exception as e:
+                        st.error(f"Помилка моделі: {e}")
+
+
+# ---------- тижневий звіт (доповнює «Дайджест») ----------
+def weekly_report(days: int = 7) -> str:
+    now = dt.datetime.now()
+    t0, t1 = (now - dt.timedelta(days=days)).timestamp(), now.timestamp()
+    rows = vault.db.execute("SELECT id, source, title, ts FROM docs WHERE ts>=? AND ts<=? ORDER BY ts DESC", (t0, t1)).fetchall()
+    vs = str(vault.db.execute("SELECT COUNT(*), COALESCE(MAX(ts),0), COALESCE(SUM(rowid),0) FROM docs").fetchone())
+    cnt = Counter(r[1] for r in rows)
+    out = [f"# Звіт за {days} дн. · {now:%d.%m.%Y}", "", "## Підсумок",
+           "- " + (", ".join(f"{SRC.get(k, k)}: {v}" for k, v in cnt.items()) or "нових документів немає"), ""]
+    recent = {r[0] for r in rows}
+    active = sorted(((len(recent & set(p["docs"])), p) for p in people_index(vault, vs).values()), key=lambda x: -x[0])
+    active = [(n, p) for n, p in active if n][:5]
+    if active:
+        out += ["## Найактивніші контакти"] + [f"- {p['name'] or p['email']} ({p['email']}) — {n}" for n, p in active] + [""]
+    ev = vault.db.execute("SELECT title, ts FROM docs WHERE source='calendar' AND ts>? AND ts<=? ORDER BY ts",
+                          (t1, t1 + days * 86400)).fetchall()
+    if ev:
+        out += [f"## Події на наступні {days} дн."] + [f"- {dt.datetime.fromtimestamp(ts):%d.%m %H:%M} — {t}" for t, ts in ev] + [""]
+    today = dt.date.today()
+    dl = deadline_index(vault, vs)
+    over = [d for d in dl if today - dt.timedelta(days=14) <= d["date"] < today]
+    soon = [d for d in dl if today <= d["date"] <= today + dt.timedelta(days=14)]
+    if over or soon:
+        out += ["## Дедлайни"] + [f"- ⚠️ {d['date']:%d.%m} (прострочено) — {d['text']}" for d in over] + \
+               [f"- {d['date']:%d.%m} — {d['text']}" for d in soon] + [""]
+    if rows:
+        out += ["## Нове за період"] + [f"- {fmt(ts)} · {SRC.get(s_, s_)} · {t[:90]}" for _, s_, t, ts in rows[:15]]
+    return "\n".join(out)
+
+
+with tab_dig:
+    if vault.stats():
+        st.subheader("📄 Звіт за період")
+        rdays = st.slider("Період звіту, днів", 3, 31, 7, key="rep_days")
+        if st.button("Сформувати звіт", key="rep_btn"):
+            st.session_state.report = weekly_report(rdays)
+        if "report" in st.session_state:
+            rep = st.session_state.report
+            with st.container(border=True):
+                st.markdown(rep)
+            r1, r2 = st.columns(2)
+            r1.download_button("⬇️ Завантажити звіт (.md)", rep, "report.md")
+            if r2.button("✨ Резюме й пріоритети від моделі", key="rep_llm"):
+                if provider == "none":
+                    st.info("Оберіть модель у бічній панелі — резюме формує LLM.")
+                else:
+                    try:
+                        with st.spinner("Аналізую…"):
+                            ans, sent = ask_llm("Зроби короткий підсумок періоду та виділи 3 пріоритети на наступний тиждень.",
+                                                [dict(n=1, source="note", title="Звіт", ts=time.time(), text=rep[:6000])],
+                                                [], provider, model, redact, host)
                         st.markdown(ans)
                         if sent:
                             show_sent(sent)
