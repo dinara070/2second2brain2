@@ -1,7 +1,7 @@
 """🧠 Другий мозок — персональний пошук і Q&A по пошті, календарю та нотатках. Один файл."""
 from __future__ import annotations
 
-import base64, datetime as dt, email, hashlib, imaplib, io, os, re, sqlite3, tempfile, time, zlib
+import base64, datetime as dt, email, hashlib, imaplib, io, json, os, re, sqlite3, tempfile, time, zlib
 from email import policy
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS docs(id TEXT PRIMARY KEY, source TEXT, title TEXT, bo
 CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, doc_id TEXT, idx INT, text TEXT, emb BLOB);
 CREATE INDEX IF NOT EXISTS chunks_doc ON chunks(doc_id);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, text TEXT, who TEXT, due TEXT, doc TEXT, title TEXT, done INT, ts REAL);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(text, tokenize='unicode61 remove_diacritics 2');
 """
 
@@ -309,6 +310,7 @@ STYLES = {
     "detailed": "Дай розгорнуту відповідь зі структурою: підсумок, деталі, відкриті питання.",
     "actions": "Оформи відповідь як список конкретних дій із дедлайнами та відповідальними, якщо вони відомі.",
     "draft": "Це завдання з написання листа. Пиши лише готовий текст листа, без посилань [n] і без коментарів.",
+    "json": "Відповідай ЛИШЕ валідним JSON без пояснень і без markdown-огорож. Не став посилань [n] у тексті, номер джерела вказуй у полі src.",
 }
 
 
@@ -547,8 +549,8 @@ if vault.stats() and vault.kind() not in (None, emb.name):
     if st.button("Переіндексувати"):
         bar = st.progress(0.0); vault.reindex(emb, bar.progress); vault.save(); st.rerun()
 
-tab_chat, tab_dig, tab_src, tab_arch, tab_ppl, tab_tl, tab_map, tab_tm = st.tabs(
-    ["💬 Питання", "📰 Дайджест", "📥 Джерела", "🗂 Архів", "👥 Люди", "🕰 Хронологія", "🕸 Мапа", "⏳ Машина часу"])
+tab_chat, tab_ai, tab_dig, tab_src, tab_arch, tab_ppl, tab_tl, tab_map, tab_tm = st.tabs(
+    ["💬 Питання", "🤖 ШІ", "📰 Дайджест", "📥 Джерела", "🗂 Архів", "👥 Люди", "🕰 Хронологія", "🕸 Мапа", "⏳ Машина часу"])
 
 # ---------- чат ----------
 def show_sources(hits):
@@ -1591,3 +1593,350 @@ with tab_tm:
                     show_sent(res["sent"])
             elif provider == "none" and res["new"]:
                 st.caption("Підключіть модель у бічній панелі, щоб отримати стислий підсумок змін.")
+
+
+# =====================================================================
+# 8. 🤖 ШІ: агент-дослідник, завдання, тріаж пошти, теми
+# =====================================================================
+PROMPT_TASKS = """Випиши всі завдання, обіцянки та домовленості, що потребують дії. Поверни JSON-масив об'єктів: {"task": "що зробити", "who": "відповідальний або порожній рядок", "due": "дата YYYY-MM-DD або порожній рядок", "src": номер джерела}. Лише реальні дії, без дублікатів."""
+PROMPT_TRIAGE = """Для кожного листа визнач, чи потрібна відповідь від мене, пріоритет і причину одним реченням. Поверни JSON-масив: {"src": номер джерела, "needs_reply": true або false, "priority": "high", "medium" або "low", "reason": "причина"}."""
+PROMPT_NAMES = """Кожне джерело — це група документів однієї теми. Дай кожній групі коротку назву теми (2–4 слова). Поверни JSON-масив: {"src": номер групи, "name": "назва"}."""
+PRIO = {"high": "🔴 Висока", "medium": "🟡 Середня", "low": "🟢 Низька"}
+
+
+def parse_json(text: str):
+    t = re.sub(r"```(?:json)?", "", text or "").strip()
+    opens = sorted((t.find(o), o, c) for o, c in (("[", "]"), ("{", "}")) if t.find(o) != -1)
+    for i, _, c in opens:
+        j = t.rfind(c)
+        if j > i:
+            try:
+                return json.loads(t[i:j + 1])
+            except ValueError:
+                pass
+    return None
+
+
+def llm_json(q, hits):
+    txt, sent = ask_llm(q, hits, [], provider, model, redact, host, "json")
+    return parse_json(txt), sent, txt
+
+
+def find_due(line: str, ref_ts: float):
+    ref = dt.datetime.fromtimestamp(ref_ts)
+    for a, b, c in NUM_D.findall(line):
+        if d := _mkdate(int(a), int(b), c or None, ref):
+            return d
+    for a, b, c in TXT_D.findall(line):
+        if d := _mkdate(int(a), MONTH_GEN[b.lower()], c or None, ref):
+            return d
+    return None
+
+
+def recent_hits(days, sources, limit, kw_only=False, first_only=False, maxlen=700):
+    now = time.time()
+    q = ("SELECT d.id, d.source, d.title, d.ts, c.text FROM chunks c JOIN docs d ON d.id=c.doc_id "
+         f"WHERE d.source IN ({','.join('?' * len(sources))}) AND d.ts>=? AND d.ts<=? "
+         + ("AND c.idx=0 " if first_only else "") + "ORDER BY d.ts DESC, c.idx LIMIT 800")
+    out = []
+    for did, s_, t, ts, text in vault.db.execute(q, [*sources, now - days * 86400, now]):
+        if kw_only and not KW.search(text):
+            continue
+        out.append(dict(n=len(out) + 1, id=did, source=s_, title=t, ts=ts, text=text[:maxlen]))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def add_task(text, who="", due="", doc="", title="") -> bool:
+    try:
+        dt.date.fromisoformat(due)
+    except ValueError:
+        due = ""
+    tid = hashlib.md5((text + doc).encode()).hexdigest()[:12]
+    cur = vault.db.execute("INSERT OR IGNORE INTO tasks(id,text,who,due,doc,title,done,ts) VALUES(?,?,?,?,?,?,0,?)",
+                           (tid, text[:300], who[:80], due, doc, title[:120], time.time()))
+    return cur.rowcount > 0
+
+
+def triage_rule(h):
+    t, today = h["text"].lower(), dt.date.today()
+    needs = "?" in t or bool(re.search(r"(просимо|прошу|підтвердіть|чекаємо на відповідь|надішліть|потрібно|треба)", t))
+    due = find_due(h["text"], h["ts"])
+    urgent = bool(re.search(r"(терміново|urgent|asap|не пізніше|дедлайн)", t)) or bool(due and 0 <= (due - today).days <= 7)
+    return dict(needs=needs, prio="high" if urgent and needs else "medium" if needs or urgent else "low",
+                reason="Є питання чи прохання" if needs else "Інформаційний лист" if not urgent else "Є термін")
+
+
+def doc_vectors():
+    acc = {}
+    for did, title, s_, ts, e in vault.db.execute(
+            "SELECT d.id, d.title, d.source, d.ts, c.emb FROM docs d JOIN chunks c ON c.doc_id=d.id WHERE c.emb IS NOT NULL"):
+        v = np.frombuffer(e, "float16").astype("float32")
+        if did in acc:
+            acc[did][3] += v; acc[did][4] += 1
+        else:
+            acc[did] = [title, s_, ts, v.copy(), 1]
+    ids = list(acc)
+    X = np.stack([acc[i][3] / acc[i][4] for i in ids]) if ids else np.zeros((0, 1), "float32")
+    X /= np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-9)
+    return ids, acc, X
+
+
+def kmeans(X, k, iters=25):
+    rng = np.random.default_rng(0)
+    C = X[rng.choice(len(X), k, replace=False)].copy()
+    for _ in range(iters):
+        lab = (X @ C.T).argmax(1)
+        for j in range(k):
+            m = X[lab == j]
+            if len(m):
+                C[j] = m.mean(0); C[j] /= max(np.linalg.norm(C[j]), 1e-9)
+    return (X @ C.T).argmax(1)
+
+
+def onboarding_ai():
+    st.subheader("🤖 ШІ-інструменти для вашого архіву")
+    st.write("Кілька помічників, які самі працюють з вашими документами. Додайте дані — і вони оживуть.")
+    c = st.columns(4)
+    for col, (t, d) in zip(c, (("🔬 Дослідження", "Агент планує підзапити, збирає факти й пише звіт із посиланнями."),
+                               ("✅ Завдання", "Знаходить обіцянки й дедлайни, веде список із відмітками «виконано»."),
+                               ("📬 Тріаж пошти", "Підказує, на які листи треба відповісти, і пише чернетку."),
+                               ("🧩 Теми", "Автоматично групує архів за темами й дає їм назви."))):
+        with col.container(border=True):
+            st.markdown(f"#### {t}")
+            st.caption(d)
+    st.caption("З моделлю (Claude/Ollama) — повноцінний ШІ; без неї працює спрощений режим на правилах.")
+    quick_start("ai")
+
+
+with tab_ai:
+    if not vault.stats():
+        onboarding_ai()
+    else:
+        if provider == "none":
+            st.info("🤖 Модель не підключено — працює спрощений режим на правилах. Для повного ШІ оберіть Claude або Ollama "
+                    "у бічній панелі.")
+        t_dr, t_tk, t_tr, t_tp = st.tabs(["🔬 Дослідження", "✅ Завдання", "📬 Тріаж пошти", "🧩 Теми"])
+
+        # ---------- агент-дослідник ----------
+        with t_dr:
+            st.caption("Агент сам планує підзапити, збирає фрагменти з архіву й пише структурований звіт із посиланнями.")
+            q_dr = st.text_area("Тема дослідження", key="ai_dr_q", height=80,
+                                placeholder="напр.: зведення по співпраці з постачальником: що домовлено, що змінилося, що відкрито")
+            depth = st.slider("Скільки підзапитів", 2, 6, 4, key="ai_dr_depth")
+            if st.button("🔬 Дослідити", key="ai_dr_go", type="primary") and q_dr.strip():
+                rng_dr = manual_rng or parse_dates(q_dr)
+                res = dict(q=q_dr, plan=[], hits=[], report=None, sent=[])
+                with st.status("Агент працює…", expanded=True) as stt:
+                    plan = None
+                    if provider != "none":
+                        try:
+                            st.write("🧭 Планую підзапити…")
+                            plan, s1, _ = llm_json(f"Питання користувача: {q_dr[:500]}\n\nРозбий його на {depth} коротких "
+                                                   f"пошукових запитів (2–6 слів), що разом покривають тему. Поверни JSON-масив рядків.", [])
+                            res["sent"].append(s1)
+                        except Exception as e:
+                            st.write(f"⚠️ Планування не вдалося: {e}")
+                    plan = [str(x).strip() for x in plan if isinstance(x, str) and x.strip()][:depth] if isinstance(plan, list) else []
+                    if not plan:
+                        plan = [w for w in re.findall(r"\w{4,}", q_dr.lower()) if w not in STOP][:depth]
+                    res["plan"], seen, merged = plan, set(), []
+                    for sq in [q_dr[:200]] + plan:
+                        found = search(vault, sq, emb, 5, kinds, rng_dr)
+                        st.write(f"🔎 «{sq[:60]}» → {len(found)} фрагм.")
+                        for h in found:
+                            if (h["id"], h["text"][:80]) not in seen and len(merged) < 14:
+                                seen.add((h["id"], h["text"][:80])); merged.append(h)
+                    for i, h in enumerate(merged):
+                        h["n"] = i + 1
+                    res["hits"] = merged
+                    if provider != "none" and merged:
+                        try:
+                            st.write(f"✍️ Пишу звіт за {len(merged)} фрагментами…")
+                            res["report"], s2 = ask_llm(
+                                q_dr + "\n\nПідготуй структуроване дослідження: ## Висновок (2–3 речення); ## Деталі за підтемами "
+                                "(з посиланнями [n]); ## Що невідомо або суперечить; ## Наступні кроки.",
+                                merged, [], provider, model, redact, host, "detailed")
+                            res["sent"].append(s2)
+                        except Exception as e:
+                            st.write(f"⚠️ Помилка моделі: {e}")
+                    stt.update(label="Готово", state="complete", expanded=False)
+                st.session_state.ai_dr = res
+            r = st.session_state.get("ai_dr")
+            if r:
+                st.divider()
+                st.markdown("**План агента:** " + " → ".join(f"«{p}»" for p in r["plan"]))
+                if r["report"]:
+                    st.markdown(r["report"])
+                elif r["hits"]:
+                    st.info("Без моделі показано зібрані фрагменти.")
+                else:
+                    st.warning("За цими підзапитами нічого не знайдено.")
+                if r["hits"]:
+                    show_sources(r["hits"])
+                if any(r["sent"]):
+                    show_sent("\n\n=====\n\n".join(x for x in r["sent"] if x))
+                if r["report"] and st.button("📌 Зберегти звіт у пам'ять", key="ai_dr_pin"):
+                    vault.upsert(f"note:research:{hashlib.md5(r['report'].encode()).hexdigest()[:10]}", "note",
+                                 f"Дослідження: {r['q'][:70]}",
+                                 r["report"] + "\n\nДжерела: " + "; ".join(f"[{h['n']}] {h['title']}" for h in r["hits"]),
+                                 time.time(), emb)
+                    vault.save(); st.toast("Збережено в пам'ять 📌")
+
+        # ---------- завдання ----------
+        with t_tk:
+            if msg := st.session_state.pop("ai_msg", None):
+                st.success(msg)
+            k1, k2 = st.columns([2, 1])
+            tk_days = k1.slider("Шукати в документах за останні, днів", 7, 120, 30, key="ai_tk_days")
+            if k2.button("✨ Знайти завдання", key="ai_tk_go", type="primary"):
+                hits = recent_hits(tk_days, ("mail", "note"), 25, kw_only=True)
+                added = 0
+                if not hits:
+                    st.session_state.ai_msg = "У цьому періоді не знайдено фраз про домовленості чи завдання."
+                elif provider == "none":
+                    for h in hits:
+                        for line in h["text"].splitlines():
+                            if KW.search(line):
+                                due = find_due(line, h["ts"])
+                                added += add_task(line.strip(), "", due.isoformat() if due else "", h["id"], h["title"])
+                    st.session_state.ai_msg = f"Додано завдань: {added} (режим правил)."
+                else:
+                    try:
+                        with st.spinner("ШІ читає документи…"):
+                            data, sent, raw = llm_json(PROMPT_TASKS, hits)
+                        by_n = {h["n"]: h for h in hits}
+                        for it in data if isinstance(data, list) else []:
+                            if isinstance(it, dict) and str(it.get("task", "")).strip():
+                                h = by_n.get(it.get("src"), {})
+                                added += add_task(str(it["task"]), str(it.get("who") or ""), str(it.get("due") or ""),
+                                                  h.get("id", ""), h.get("title", ""))
+                        st.session_state.ai_msg = (f"Додано завдань: {added}." if isinstance(data, list)
+                                                   else "Модель повернула відповідь не у форматі JSON — спробуйте ще раз.")
+                    except Exception as e:
+                        st.session_state.ai_msg = f"Помилка моделі: {e}"
+                vault.save(); st.rerun()
+
+            n1, n2 = st.columns([4, 1])
+            new_t = n1.text_input("Додати завдання вручну", key="ai_tk_new", placeholder="напр.: Надіслати звіт Марії до п'ятниці")
+            if n2.button("Додати", key="ai_tk_add") and new_t.strip():
+                add_task(new_t.strip(), doc="manual", title="вручну"); vault.save(); st.rerun()
+
+            show_done = st.checkbox("Показувати виконані", False, key="ai_tk_done")
+            rows = vault.db.execute("SELECT id, text, who, due, title, done FROM tasks "
+                                    "ORDER BY done, CASE WHEN due='' THEN 1 ELSE 0 END, due, ts DESC").fetchall()
+            today_s = dt.date.today().isoformat()
+            open_n = sum(1 for r_ in rows if not r_[5])
+            st.caption(f"Відкритих: {open_n} · виконаних: {len(rows) - open_n}")
+            for tid, text, who, due, title, done in rows:
+                if done and not show_done:
+                    continue
+                label = text[:160] + (f" · 👤 {who}" if who else "") + \
+                    (f" · {'⚠️ ' if due < today_s and not done else '⏰ '}{due}" if due else "") + \
+                    (f" · _{title[:40]}_" if title else "")
+                c1, c2 = st.columns([12, 1])
+                val = c1.checkbox(label, value=bool(done), key=f"ai_tk_{tid}")
+                if c2.button("🗑", key=f"ai_tkdel_{tid}"):
+                    vault.db.execute("DELETE FROM tasks WHERE id=?", (tid,)); vault.save(); st.rerun()
+                if val != bool(done):
+                    vault.db.execute("UPDATE tasks SET done=? WHERE id=?", (int(val), tid)); vault.save(); st.rerun()
+            dated = [dict(date=dt.date.fromisoformat(r_[3]), text=r_[1], title=r_[4]) for r_ in rows if r_[3] and not r_[5]]
+            if dated:
+                st.download_button("⬇️ Завдання з датами в календар (.ics)", deadlines_ics(dated), "tasks.ics", "text/calendar")
+
+        # ---------- тріаж пошти ----------
+        with t_tr:
+            r1, r2 = st.columns(2)
+            tr_days = r1.slider("Листи за останні, днів", 3, 60, 14, key="ai_tr_days")
+            tr_n = r2.slider("Скільки листів аналізувати", 5, 40, 20, key="ai_tr_n")
+            if st.button("📬 Проаналізувати пошту", key="ai_tr_go", type="primary"):
+                hits = recent_hits(tr_days, ("mail",), tr_n, first_only=True, maxlen=500)
+                rowsx, sent = [], None
+                if provider != "none" and hits:
+                    try:
+                        with st.spinner("ШІ читає листи…"):
+                            data, sent, raw = llm_json(PROMPT_TRIAGE, hits)
+                        verdicts = {it.get("src"): it for it in data if isinstance(it, dict)} if isinstance(data, list) else {}
+                    except Exception as e:
+                        st.error(f"Помилка моделі: {e}"); verdicts = {}
+                else:
+                    verdicts = {}
+                for h in hits:
+                    v = verdicts.get(h["n"])
+                    base = triage_rule(h)
+                    if v:
+                        base = dict(needs=bool(v.get("needs_reply")), prio=v.get("priority") if v.get("priority") in PRIO else "medium",
+                                    reason=str(v.get("reason", ""))[:200])
+                    rowsx.append({**h, **base})
+                rowsx.sort(key=lambda x: (list(PRIO).index(x["prio"]), not x["needs"], -x["ts"]))
+                st.session_state.ai_tr = dict(rows=rowsx, sent=sent)
+            tr = st.session_state.get("ai_tr")
+            if tr:
+                if not tr["rows"]:
+                    st.info("Листів за цей період немає.")
+                else:
+                    st.dataframe(pd.DataFrame([{"Пріоритет": PRIO[x["prio"]], "Відповісти": "так" if x["needs"] else "ні",
+                                                "Дата": fmt(x["ts"]), "Тема": x["title"][:70], "Чому": x["reason"]}
+                                               for x in tr["rows"]]), hide_index=True)
+                    if tr["sent"]:
+                        show_sent(tr["sent"])
+                    idx = st.selectbox("Лист для відповіді", range(len(tr["rows"])), key="ai_tr_pick",
+                                       format_func=lambda i: f"{PRIO[tr['rows'][i]['prio']][:2]} {tr['rows'][i]['title'][:70]}")
+                    tone = st.selectbox("Тон", ["діловий", "дружній", "стислий"], key="ai_tr_tone")
+                    if st.button("✍️ Чернетка відповіді", key="ai_tr_draft"):
+                        if provider == "none":
+                            st.info("Оберіть модель у бічній панелі — чернетку пише LLM.")
+                        else:
+                            try:
+                                with st.spinner("Пишу…"):
+                                    st.session_state.ai_tr_out, _ = ask_llm(
+                                        f"Напиши відповідь на цей лист ({tone} тон), українською.", [tr["rows"][idx]],
+                                        [], provider, model, redact, host, "draft")
+                            except Exception as e:
+                                st.error(f"Помилка моделі: {e}")
+                    if st.session_state.get("ai_tr_out"):
+                        st.text_area("Чернетка (можна редагувати)", st.session_state.ai_tr_out, height=200,
+                                     key=f"ai_tr_txt_{hashlib.md5(st.session_state.ai_tr_out.encode()).hexdigest()[:6]}")
+
+        # ---------- теми ----------
+        with t_tp:
+            ids, acc, X = doc_vectors()
+            if len(ids) < 4 or vault.kind() != emb.name:
+                st.info("Для тем потрібно щонайменше 4 документи з актуальним індексом "
+                        "(якщо змінювали семантичний рушій — переіндексуйте сховище).")
+            else:
+                k_t = st.slider("Скільки тем", 2, min(12, len(ids)), min(5, len(ids)), key="ai_tp_k")
+                name_it = st.checkbox("Назвати теми моделлю", provider != "none", disabled=provider == "none", key="ai_tp_name")
+                if st.button("🧩 Побудувати теми", key="ai_tp_go", type="primary"):
+                    lab = kmeans(X, k_t)
+                    groups = []
+                    for j in range(k_t):
+                        docs_j = [(ids[i], *acc[ids[i]][:3]) for i in range(len(ids)) if lab[i] == j]
+                        if not docs_j:
+                            continue
+                        words = Counter(w for _, t, _, _ in docs_j for w in re.findall(r"\w{5,}", t.lower()) if w not in STOP)
+                        groups.append(dict(name=" · ".join(w for w, _ in words.most_common(3)) or f"Тема {j + 1}",
+                                           docs=sorted(docs_j, key=lambda d: -d[3])))
+                    sent = None
+                    if name_it and provider != "none":
+                        try:
+                            pseudo = [dict(n=i + 1, source="note", title=f"Група {i + 1}", ts=time.time(),
+                                           text="; ".join(d[1] for d in g["docs"][:12])) for i, g in enumerate(groups)]
+                            with st.spinner("ШІ називає теми…"):
+                                data, sent, _ = llm_json(PROMPT_NAMES, pseudo)
+                            for it in data if isinstance(data, list) else []:
+                                if isinstance(it, dict) and isinstance(it.get("src"), int) and 1 <= it["src"] <= len(groups):
+                                    groups[it["src"] - 1]["name"] = str(it.get("name", groups[it["src"] - 1]["name"]))[:60]
+                        except Exception as e:
+                            st.warning(f"Назви від моделі недоступні: {e}")
+                    st.session_state.ai_tp = dict(groups=sorted(groups, key=lambda g: -len(g["docs"])), sent=sent)
+                tp = st.session_state.get("ai_tp")
+                if tp:
+                    st.bar_chart(pd.Series({g["name"]: len(g["docs"]) for g in tp["groups"]}))
+                    for g in tp["groups"]:
+                        with st.expander(f"{g['name']} · {len(g['docs'])}"):
+                            for _, t, s_, ts in g["docs"][:30]:
+                                st.markdown(f"{fmt(ts)} · {SRC.get(s_, s_)} · {t[:90]}")
+                    if tp["sent"]:
+                        show_sent(tp["sent"])
